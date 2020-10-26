@@ -1,0 +1,623 @@
+#!/bin/sh
+# Copyright (C) 2006-2007,2009,2011 G.P. Halkes
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License version 3, as
+# published by the Free Software Foundation.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+# Set zsh to emulate sh (otherwise all kinds of eval's wont work)
+[ -n "${ZSH_VERSION}" ] && emulate sh
+
+#==============================
+# Functions
+#==============================
+error() {
+	echo "$*"
+	[ -n "$DUMP_LOG" ] && cat config.log
+	exit 1
+}
+
+not() {
+	if "$@" ; then
+		false
+	else
+		true
+	fi
+}
+
+check() {
+	if not "$@" ; then
+		error "Error executing $*. Aborting."
+	fi
+}
+
+check_message() {
+	printf "$*"
+	echo "----------------------------------" >> config.log
+	echo "$*" >> config.log
+}
+
+check_message_result() {
+	echo "$*"
+	echo "$*" >> config.log
+}
+
+clean() {
+	rm -rf "$@" >/dev/null 2>&1
+}
+
+test_make() {
+	printf "%s" "Running: ${MAKE} -f .Makefile" >> config.log
+	for ARG in "$@"
+	do
+		printf " '%s'" "${ARG}" >> config.log
+	done
+	echo >> config.log
+	"${MAKE}" -f .Makefile "$@"
+}
+
+test_install() {
+	clean .foo
+	check_message "Checking for working install ($*)... "
+
+	if  test_make "INSTALL=$*" "install" >> config.log 2>&1 ; then
+		check_message_result "yes"
+		true
+	else
+		check_message_result "no"
+		false
+	fi
+}
+
+test_and_set() {
+	SETTING="$4${5+ }$5"
+	if $1 "$2${SETTING+ in }${SETTING}" "TESTFLAGS=$4" "TESTLIBS=$5" ; then
+		eval "${3}_FLAGS=\"$4\""
+		eval "${3}_LIBS=\"$5\""
+		true
+	else
+		false
+	fi
+}
+
+add_replace_settings() {
+	for SETTING
+	do
+		echo "/^${SETTING%%=*}/s/^/# Disabled by configure: /"
+		echo "/\.POSIX/a\\
+${SETTING}"
+	done
+}
+
+replace_default() {
+	if [ -n "$2" ] ; then
+		echo "/^$1=/c\\
+$1=$2"
+	fi
+}
+
+insert() {
+	echo "/^$1/d"
+	[ -n "$2" ] && echo "/^\\.POSIX:/a\\
+$1=$2"
+}
+
+create_makefile() {
+	for _INSTALL in ${TEST_INSTALL}
+	do
+		# Don't test the sun install program, because it is dangerous.
+		if [ "`uname`" = "SunOS" ] && [ "$_INSTALL" = "install" ] ; then
+			continue
+		fi
+		test_install "${_INSTALL}" && INSTALL="${_INSTALL}" && break
+	done
+	if [ -z "${INSTALL}" ] ; then
+		check_message_result "!! No working install program found. The install target will not work."
+	fi
+
+	{
+		echo '/\.POSIX/a\
+# Settings from configure script'
+		replace_default prefix "${PREFIX}"
+		for INSTALLDIR in ${INSTALLDIRS}
+		do
+			[ -n "`eval echo \\${option_${INSTALLDIR}}`" ] && replace_default "${INSTALLDIR}" "`eval echo \\${option_${INSTALLDIR}}`"
+		done
+		replace_default INSTALL "${INSTALL}"
+
+		insert LDFLAGS "${LDFLAGS}"
+		insert LDLIBS "${LDLIBS}"
+
+		for EXT in ${EXTENSIONS}
+		do
+			sed_rules_${EXT}
+		done
+
+		add_replace_settings "$@"
+		[ -n "${SEDEXTRA}" ] && ${SEDEXTRA}
+	} > .sedscript
+	for MAKEFILE in ${MAKEFILES:-Makefile}
+	do
+		echo "----------------------------------">> config.log
+		check_message_result "Creating ${MAKEFILE}"
+		cat ${MAKEFILE}.in | sed -f .sedscript > ${MAKEFILE}
+	done
+	clean .Makefile .Makefile.in .sedscript .foo .config_base
+	for EXT in ${EXTENSIONS}
+	do
+		clean_${EXT}
+	done
+	exit 0
+}
+
+#==============================
+# Setup
+#==============================
+unset LINKRULE COMPILERULE USERRULES USERHELP EXTENSIONS SWITCHES PRECHECKFUNC INSTALLDIRS DUMP_LOG HOST_PREFIX
+
+. ./config.pkg
+
+for MAKEFILE in ${MAKEFILES:-Makefile}
+do
+	[ -f ${MAKEFILE}.in ] || error "${MAKEFILE}.in does not exist"
+	grep "^\\.POSIX:" ${MAKEFILE}.in > /dev/null || error "${MAKEFILE}.in does not contain .POSIX target"
+done
+
+#@INCLUDE_START
+[ "${EXTENSIONS}" = "c verbose_compile gettext" ] || error "EXTENSIONS changed after running merge_config. Run merge_config again."
+SWITCHES="${SWITCHES} +c99"
+SUFFIXES="${SUFFIXES} .c .o"
+[ -z "${LINKRULE}" ] && LINKRULE='$(CC) $(CFLAGS) $(LDFLAGS) -o $@ .config.o $(LDLIBS) $(TESTLIBS)'
+[ -z "${COMPILERULE}" ] && COMPILERULE='$(CC) $(CFLAGS) $(TESTFLAGS) -c -o $@ $<'
+
+clean_c() {
+	clean .config .config.o .config.c
+}
+
+show_help_c() {
+	if [ "$1" = VARIABLES ] ; then
+		cat <<EOF
+  CC          C compiler to use (defaults to search gcc, clang and make default)
+  CFLAGS      C-compiler flags to use [-O2]
+EOF
+	fi
+}
+
+print_rules_c() {
+	if [ -n "${CC}" ] ; then
+		echo "CC=${CC}"
+	fi
+	[ -z "${CFLAGS}" ] && CFLAGS=-O2
+	cat <<EOF
+CFLAGS=${CFLAGS}
+
+.config:.config.o
+	${LINKRULE}
+
+.c.o:
+	${COMPILERULE}
+
+EOF
+}
+
+basic_test_c() {
+	cat > .config.c <<EOF
+int main(int argc, char *argv[]) {
+	return 0;
+}
+EOF
+	if [ -z "$CC" ] ; then
+		for COMPILER in gcc clang
+		do
+			if test_link "working C compiler (${COMPILER})" CC="${COMPILER}" ; then
+				CC="${COMPILER}"
+				return
+			fi
+		done
+	fi
+	test_link "working C compiler (${CC-${MAKE} default})" || error "No working C compiler found. See config.log for errors."
+}
+
+has_support_c99() {
+	if [ "no" = "${with_c99}" ] ; then
+		return
+	fi
+	clean_c
+	cat > .config.c <<EOF
+#if !defined(__STDC_VERSION__) || __STDC_VERSION__ < 199901L
+#error Not a C99 compiler
+#endif
+int main(int argc, char *argv[]) {
+	return 0;
+}
+EOF
+	if test_link "C99 support in ${CC} as default" ; then
+		C99=1
+	elif test_link "C99 support in ${CC} with -std=c99" CFLAGS="$CFLAGS -std=c99" ; then
+		CFLAGS="${CFLAGS} -std=c99"
+		C99=1
+	fi
+}
+
+sed_rules_c() {
+	insert CFLAGS "${CFLAGS}"
+	[ -n "${CC}" ] && insert CC "${CC}"
+}
+
+test_compile() {
+	clean .config.o
+	check_message "Checking for $1... "
+	shift
+
+	if test_make "CFLAGS=$CFLAGS" "$@" .config.o >> config.log 2>&1 ; then
+		check_message_result "yes"
+		true
+	else
+		check_message_result "no"
+		echo "Source of the failed compile:" >> config.log
+		nl -ba .config.c >> config.log
+		false
+	fi
+}
+
+test_link() {
+	clean .config
+	check_message "Checking for $1... "
+	shift
+
+	if test_make "CFLAGS=$CFLAGS" "$@" .config >> config.log 2>&1 ; then
+		check_message_result "yes"
+		true
+	else
+		check_message_result "no"
+		echo "Source of the failed compile:" >> config.log
+		nl -ba .config.c >> config.log
+		false
+	fi
+}
+
+touch_c() {
+	[ -f .config.c ] && touch .config.c
+}
+SWITCHES="${SWITCHES} -verbose-compile"
+
+clean_verbose_compile() {
+	:
+}
+
+show_help_verbose_compile() {
+	if [ "$1" = OPTIONS ] ; then
+		cat <<EOF
+  --with-verbose-compile   Echo all commands during compile
+EOF
+	fi
+}
+
+print_rules_verbose_compile() {
+	:
+}
+
+basic_test_verbose_compile() {
+	:
+}
+
+sed_rules_verbose_compile() {
+	[ yes = "${with_verbose_compile}" ] && echo '/^SILEN\(CE\|T\)/d'
+}
+SWITCHES="${SWITCHES} +gettext"
+OPTIONS="${OPTIONS} localedir"
+SUFFIXES="${SUFFIXES} .mo .po"
+
+[ -z "${DEFAULT_LINGUAS}" ] && error "!! DEFAULT_LINGUAS not set"
+
+show_help_gettext() {
+	if [ "$1" = OPTIONS ] ; then
+		echo "  --without-gettext      Disable gettext translations"
+		echo "  --localedir=<dir>      Install directory for locales [prefix/share/locale]"
+	fi
+}
+
+print_rules_gettext() {
+	cat <<EOF
+.po.mo:
+	msgfmt -o \$@ \$<
+EOF
+}
+
+clean_gettext() {
+	clean .config.po .config.mo
+}
+
+sed_rules_gettext() {
+	replace_default GETTEXTFLAGS "${GETTEXTFLAGS}"
+	replace_default GETTEXTLIBS "${GETTEXTLIBS}"
+	[ -n "${option_localedir}" ] &&	replace_default LOCALEDIR "${option_localedir}"
+	replace_default LINGUAS "${linguas}"
+}
+
+basic_test_gettext() {
+	unset GETTEXTFLAGS GETTEXTLIBS linguas LOCALEDIR
+	# Check for gettext functionality
+	if [ "yes" = "${with_gettext}" ] ; then
+		cat > .config.c <<EOF
+#include <locale.h>
+#include <libintl.h>
+
+int main(int argc, char *argv[]) {
+	setlocale(LC_ALL, "");
+	bindtextdomain("package", "/usr/share/locale");
+	dgettext("package", "string");
+	textdomain("package");
+	gettext("package");
+	return 0;
+}
+EOF
+		{
+			test_compile "gettext and related functions" && {
+				test_link "gettext in standard library" ||
+				{ test_link "gettext in -lintl" TESTLIBS=-lintl && GETTEXTLIBS=-lintl ; } ||
+				{ test_link "gettext in -lintl -liconv" "TESTLIBS=-lintl -liconv" && GETTEXTLIBS="-lintl -liconv" ; }
+			} && {
+				GETTEXTFLAGS="-DUSE_GETTEXT"
+
+				clean .config.po .config.mo
+				cat > .config.po <<EOF
+msgid  "msg"
+msgstr "translation"
+EOF
+				check_message "Checking for msgfmt... "
+				if test_make .config.mo >> config.log 2>&1 ; then
+					check_message_result "yes"
+					true
+				else
+					check_message_result "no"
+					false
+				fi
+			}
+		} || {
+			error "!! Could not compile with gettext. Try configuring with --without-gettext."
+		}
+		GETTEXTFLAGS="-DUSE_GETTEXT"
+
+		if [ -n "${LINGUAS+set}" ] ; then
+			check_message "Checking for available selected translations... "
+			for lingua in ${LINGUAS}
+			do
+				found=0
+				for test_lingua in ${DEFAULT_LINGUAS}
+				do
+					if [ "${test_lingua}" = "${lingua}" ] ; then
+						found=1
+						break
+					fi
+				done
+				[ "${found}" = 1 ] && linguas="${linguas}${linguas+ }${lingua}"
+			done
+			check_message_result "done [${linguas}]"
+		else
+			linguas="${DEFAULT_LINGUAS}"
+		fi
+	fi
+}
+#@INCLUDE_END
+
+for _switch in ${SWITCHES}
+do
+	_name=`echo "${_switch}" | sed -e 's/^[+-]//' -e 's/-/_/g'`
+	_pm="${_switch%%[!-+]*}"
+	if [ "${_pm}" = "+" ] ; then
+		eval with_${_name}="yes"
+	else
+		eval with_${_name}="no"
+	fi
+done
+_SWITCHES=`echo " ${SWITCHES}" | sed 's/ [+-]/ /g'`
+
+for PARAM
+do
+	case "${PARAM}" in
+		-h|--help)
+			cat <<EOF
+Usage: configure [--prefix=<dir>] [<var>=<value>]
+
+  --dump-log             Dump config.log to stdout on error
+  --prefix=<dir>         Prefix for installation [/usr/local]
+EOF
+			for INSTALLDIR in ${INSTALLDIRS}
+			do
+				case "${INSTALLDIR}" in
+					bindir)        echo '  --bindir=<dir>         Binaries directory [<prefix>/bin]' ;;
+					sbindir)       echo '  --sbindir=<dir>        System binaries directory [<prefix>/sbin]' ;;
+					libdir)        echo '  --libdir=<dir>         Library directory [<prefix>/lib]' ;;
+					includedir)    echo '  --includedir=<dir>     Include file directory [<prefix>/include]' ;;
+					datadir)       echo '  --datadir=<dir>        Directory for data [<prefix>/share]' ;;
+					mandir)        echo '  --mandir=<dir>         Manual page directory [<prefix>/share/man]' ;;
+					infodir)       echo '  --infodir=<dir>        Info page directory [<prefix>/share/man]' ;;
+					docdir)        echo '  --docdir=<dir>         Document dir [<prefix>/share/doc/<name>-<version>]' ;;
+				esac
+			done
+			[ -n "${USERINSTALLDIRSHELP}" ] && echo "${USERINSTALLDIRSHELP}"
+
+			for EXT in ${EXTENSIONS}
+			do
+				show_help_$EXT OPTIONS
+			done
+cat <<EOF
+
+Environment variables that tune the build:
+  MAKE        Make program to use [make]
+  PREFIX      See --prefix=<dir>
+  INSTALL     The install program to use
+  LDFLAGS     Linker flags to use (default determined by make)
+  LDLIBS      Extra libraries to link
+EOF
+			for EXT in ${EXTENSIONS}
+			do
+				show_help_$EXT VARIABLES
+			done
+
+			[ -n "${USERHELP}" ] && { echo ; echo "Package specific settings" ; ${USERHELP} ; }
+
+			cat <<EOF
+
+Note: Environment variables may also be specified as parameters.
+EOF
+		exit 0
+		;;
+		--prefix=*)
+			PREFIX="${PARAM#--prefix=}"
+		;;
+		--host=*)
+			HOST_PREFIX="${PARAM#--host=}"
+			[ -z "${LIBTOOL}" ] && LIBTOOL="${HOST_PREFIX}-libtool"
+			if which "${LIBTOOL}" > /dev/null && echo "${EXTENSIONS}" | grep "libtool" > /dev/null
+			then
+				[ -z "${CC}" ] && CC="`"${LIBTOOL}" --config | grep '^CC' | tail -n1 | sed 's/.*"\([^"]\+\)".*/\1/'`"
+				[ -z "${CXX}" ] && CXX="`"${LIBTOOL}" --tag=CXX --config | grep '^CC' | tail -n1 | sed 's/.*"\([^"]\+\)".*/\1/'`"
+			else
+				[ -z "${CC}" ] && CC="${HOST_PREFIX}-gcc"
+				[ -z "${CXX}" ] && CXX="${HOST_PREFIX}-g++"
+			fi
+			[ -z "${PKG_CONFIG}" ] && PKG_CONFIG="${HOST_PREFIX}-pkg-config"
+
+			echo "INFO: cross compiling using the following settings:"
+			echo "  CC=$CC"
+			echo "  CXX=$CXX"
+			echo "  LIBTOOL=$LIBTOOL"
+			echo "  PKG_CONFIG=$PKG_CONFIG"
+		;;
+		--dump-log)
+			DUMP_LOG=1
+		;;
+		--*=*)
+			unset _match
+			for _option in ${OPTIONS} ${INSTALLDIRS}
+			do
+				case "${PARAM}" in
+					--${_option}=*)
+						_name=`echo "${_option}" | sed 's/-/_/g'`
+						_value="${PARAM#*=}"
+						eval option_${_name}="'${_value}'"
+						_match="1"
+						break
+					;;
+				esac
+			done
+			[ -z "${_match}" ] && echo "WARNING: ignoring unknown parameter: ${PARAM}" >&2
+		;;
+		--*)
+			unset _match
+			for _switch in ${_SWITCHES}
+			do
+				case "${PARAM}" in
+					--with-${_switch})
+						_name=`echo "${_switch}" | sed 's/-/_/g'`
+						eval with_${_name}="yes"
+						_match="1"
+						break
+					;;
+					--without-${_switch})
+						_name=`echo "${_switch}" | sed 's/-/_/g'`
+						eval with_${_name}="no"
+						_match="1"
+						break
+					;;
+				esac
+			done
+			[ -z "${_match}" ] && echo "WARNING: ignoring unknown parameter: ${PARAM}" >&2
+		;;
+		*=*)
+			name="${PARAM%%=*}"
+			value="${PARAM#*=}"
+			eval "${name}"="\"${value}\""
+		;;
+		*)
+			error "Error on commandline: ${PARAM}"
+		;;
+	esac
+done
+
+# Remove trailing slashes from the prefix. These are superfluous and get in
+# the way of testing.
+STRIPPED_PREFIX="${PREFIX%/}"
+while [ "${PREFIX}" != "${STRIPPED_PREFIX}" ]
+do
+	PREFIX="${STRIPPED_PREFIX}"
+	STRIPPED_PREFIX="${PREFIX%/}"
+done
+
+if [ -n "${INSTALL}" ] ; then
+	TEST_INSTALL="${INSTALL}"
+	unset INSTALL
+else
+	TEST_INSTALL="install ./install.sh"
+fi
+
+echo "Configuration test log created at `date`" > config.log
+echo "-- configure called with $0 $@" >> config.log
+
+clean config.log .Makefile .Makefile.in .sedscript .foo .config_base
+for EXT in ${EXTENSIONS}
+do
+	clean_${EXT}
+done
+
+{
+	echo ".POSIX:"
+	[ -z "${LDFLAGS}" ] || echo "LDFLAGS=${LDFLAGS}"
+	[ -z "${LDLIBS}" ] || echo "LDLIBS=${LDLIBS}"
+
+	[ -z "${SUFFIXES}" ] || echo ".SUFFIXES: ${SUFFIXES}"
+
+	[ -z "${USERRULES}" ] || ${USERRULES}
+
+	cat <<EOF
+install:
+	\$(INSTALL) -d .foo/bar
+	\$(INSTALL) -m 755 configure .foo/bar
+	test -x .foo/bar/configure
+
+.config_base:
+	touch \$@
+
+EOF
+
+	for EXT in ${EXTENSIONS}
+	do
+		print_rules_${EXT}
+	done
+} > .Makefile.in
+
+cp .Makefile.in .Makefile
+
+echo "Using settings:" >> config.log
+grep '^[[:upper:]_]\+=' .Makefile >> config.log
+
+[ -n "${MAKE}" ] ||	MAKE=make
+
+[ -z "${PRECHECKFUNC}" ] || ${PRECHECKFUNC}
+
+check_message "Checking for working make (${MAKE})... "
+if test_make .config_base >> config.log 2>&1 ; then
+	check_message_result "yes"
+else
+	check_message_result "no"
+	error "${MAKE} failed. See config.log for errors."
+fi
+
+for EXT in ${EXTENSIONS}
+do
+	basic_test_${EXT}
+	sed_rules_${EXT} >> .sedscript
+	sed -f .sedscript .Makefile.in > .Makefile
+done
+
+config
+error "Error in config.pkg. Cannot continue."
